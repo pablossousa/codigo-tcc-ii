@@ -5,6 +5,7 @@ from importlib import metadata as importlib_metadata
 import logging
 import sqlite3
 import time
+import unicodedata
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +18,7 @@ import tkinter as tk
 from cryptography.fernet import Fernet
 from facenet_pytorch import InceptionResnetV1, MTCNN
 from PIL import Image, ImageTk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox, simpledialog, ttk
 
 
 logging.basicConfig(
@@ -28,8 +29,14 @@ logging.basicConfig(
 
 POSE_LABELS = {
     "front": "frente",
-    "left": "esquerda na tela",
-    "right": "direita na tela",
+    "left": "direita",
+    "right": "esquerda",
+}
+
+POSE_POPUP_MESSAGES = {
+    "front": "Olhe para frente para iniciar a captura.",
+    "left": "Agora vire o rosto levemente para a direita.",
+    "right": "Agora vire o rosto levemente para a esquerda.",
 }
 
 
@@ -42,10 +49,13 @@ class AppConfig:
     frame_candidate_threshold: float = 1.02
     final_distance_threshold: float = 0.90
     unknown_distance_threshold: float = 1.10
+    distance_margin: float = 0.10
     temporal_window: int = 20
-    min_confirm_votes: int = 9
-    min_vote_ratio: float = 0.45
-    samples_per_pose: int = 12
+    min_valid_frames: int = 8
+    min_confirm_votes: int = 6
+    min_vote_ratio: float = 0.30
+    samples_per_pose: int = 15
+    min_samples_per_pose: int = 8
     sample_capture_interval: float = 0.25
     pose_capture_timeout: float = 35.0
     mtcnn_confidence: float = 0.90
@@ -58,6 +68,23 @@ class AppConfig:
     pose_threshold: float = 0.12
     alignment_size: int = 160
     cache_ttl_seconds: float = 10.0
+    type_recognized_id: bool = True
+    type_cooldown_seconds: float = 5.0
+    max_consecutive_typings_per_id: int = 1
+    press_enter_after_typing: bool = False
+    require_stable_recognition_before_typing: bool = True
+    min_window_width: int = 420
+    min_window_height: int = 300
+    sidebar_width: int = 280
+    sidebar_hide_width: int = 760
+    sidebar_show_width: int = 860
+    header_color: str = "#17202a"
+    sidebar_color: str = "#17202a"
+    button_text_color: str = "#1F2933"
+    register_button_color: str = "#A8D5BA"
+    delete_button_color: str = "#F4A6A6"
+    close_button_color: str = "#EFA1A1"
+    typing_control_color: str = "#A7C7E7"
     window_name: str = "Reconhecimento Facial em Tempo Real"
     base_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent)
     data_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent / "data")
@@ -69,6 +96,7 @@ class AppConfig:
 class FaceSample:
     sample_id: int
     user_id: int
+    registration_id: str
     user_name: str
     pose: str
     embedding: np.ndarray
@@ -91,6 +119,7 @@ class FaceDetection:
 @dataclass(slots=True)
 class MatchCandidate:
     user_id: int
+    registration_id: str
     user_name: str
     distance: float
     effective_distance: float
@@ -101,6 +130,7 @@ class MatchCandidate:
 @dataclass(slots=True)
 class FrameVote:
     user_id: Optional[int]
+    registration_id: Optional[str]
     user_name: Optional[str]
     distance: float
     best_distance: float
@@ -113,11 +143,13 @@ class FrameVote:
 class TemporalDecision:
     status: str
     user_id: Optional[int] = None
+    registration_id: Optional[str] = None
     user_name: Optional[str] = None
     votes: int = 0
     total_frames: int = 0
     vote_ratio: float = 0.0
     mean_distance: float = float("inf")
+    best_distance: float = float("inf")
     message: str = ""
 
 
@@ -136,6 +168,10 @@ def normalize_embedding(vector: np.ndarray) -> np.ndarray:
 def average_embeddings(embeddings: List[np.ndarray]) -> np.ndarray:
     stacked = np.vstack([ensure_float32(embedding) for embedding in embeddings])
     return normalize_embedding(np.mean(stacked, axis=0))
+
+
+def text_for_opencv(text: str) -> str:
+    return unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode("ascii")
 
 
 def clamp_box(box: np.ndarray, frame_shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
@@ -307,10 +343,14 @@ class SecureFaceDB:
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
+                registration_id TEXT UNIQUE,
+                name TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
+        )
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_registration_id ON users (registration_id) WHERE registration_id IS NOT NULL"
         )
 
     def _create_face_embeddings_table(self) -> None:
@@ -336,8 +376,27 @@ class SecureFaceDB:
             return
 
         columns = self._columns("users")
-        required = {"user_id", "name", "created_at"}
+        required = {"user_id", "registration_id", "name", "created_at"}
         if required.issubset(columns):
+            self.conn.execute(
+                "UPDATE users SET registration_id = CAST(user_id AS TEXT) WHERE registration_id IS NULL OR TRIM(registration_id) = ''"
+            )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_registration_id ON users (registration_id) WHERE registration_id IS NOT NULL"
+            )
+            return
+
+        if "registration_id" not in columns:
+            self.conn.execute("ALTER TABLE users ADD COLUMN registration_id TEXT")
+            self.conn.execute(
+                "UPDATE users SET registration_id = CAST(user_id AS TEXT) WHERE registration_id IS NULL OR TRIM(registration_id) = ''"
+            )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_registration_id ON users (registration_id) WHERE registration_id IS NOT NULL"
+            )
+            columns = self._columns("users")
+
+        if {"user_id", "name", "created_at", "registration_id"}.issubset(columns):
             return
 
         logging.info("Migrando tabela users para o formato atual")
@@ -346,17 +405,28 @@ class SecureFaceDB:
 
         legacy_columns = self._columns("users_legacy")
         id_expr = "user_id" if "user_id" in legacy_columns else ("id" if "id" in legacy_columns else "rowid")
+        registration_expr = (
+            "registration_id"
+            if "registration_id" in legacy_columns
+            else ("matricula" if "matricula" in legacy_columns else f"CAST({id_expr} AS TEXT)")
+        )
         name_expr = "name" if "name" in legacy_columns else "'user_' || rowid"
         created_expr = "created_at" if "created_at" in legacy_columns else "CURRENT_TIMESTAMP"
 
         self.conn.execute(
             f"""
-            INSERT OR IGNORE INTO users (user_id, name, created_at)
-            SELECT {id_expr}, {name_expr}, {created_expr}
+            INSERT OR IGNORE INTO users (user_id, registration_id, name, created_at)
+            SELECT {id_expr}, {registration_expr}, {name_expr}, {created_expr}
             FROM users_legacy
             """
         )
         self.conn.execute("DROP TABLE users_legacy")
+        self.conn.execute(
+            "UPDATE users SET registration_id = CAST(user_id AS TEXT) WHERE registration_id IS NULL OR TRIM(registration_id) = ''"
+        )
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_registration_id ON users (registration_id) WHERE registration_id IS NOT NULL"
+        )
 
     def _migrate_face_embeddings_table(self) -> None:
         if not self._table_exists("face_embeddings"):
@@ -394,21 +464,85 @@ class SecureFaceDB:
             self._migrate_users_table()
             self._migrate_face_embeddings_table()
 
+    def get_user_by_registration(self, registration_id: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM users WHERE registration_id = ?",
+            (registration_id.strip(),),
+        ).fetchone()
+
     def get_user_by_name(self, name: str) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM users WHERE name = ?", (name.strip(),)).fetchone()
 
-    def upsert_user(self, name: str) -> int:
+    def get_user_by_identifier(self, identifier: str) -> Optional[sqlite3.Row]:
+        clean_identifier = identifier.strip()
+        if not clean_identifier:
+            return None
+
+        row = self.get_user_by_registration(clean_identifier)
+        if row:
+            return row
+
+        if clean_identifier.isdigit():
+            row = self.conn.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (int(clean_identifier),),
+            ).fetchone()
+            if row:
+                return row
+
+        return self.conn.execute(
+            "SELECT * FROM users WHERE name = ?",
+            (clean_identifier,),
+        ).fetchone()
+
+    def list_users(self) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT
+                user_id,
+                COALESCE(registration_id, CAST(user_id AS TEXT)) AS registration_id,
+                name,
+                created_at
+            FROM users
+            ORDER BY name COLLATE NOCASE ASC, registration_id ASC
+            """
+        ).fetchall()
+
+    def upsert_user(self, registration_id: str, name: str) -> int:
+        clean_registration = registration_id.strip()
         clean_name = name.strip()
-        existing = self.get_user_by_name(clean_name)
+        existing = self.get_user_by_registration(clean_registration)
         if existing:
+            if clean_name and clean_name != str(existing["name"]):
+                with self.conn:
+                    self.conn.execute(
+                        "UPDATE users SET name = ? WHERE user_id = ?",
+                        (clean_name, int(existing["user_id"])),
+                    )
             return int(existing["user_id"])
 
         with self.conn:
             cursor = self.conn.execute(
-                "INSERT INTO users (name, created_at) VALUES (?, CURRENT_TIMESTAMP)",
-                (clean_name,),
+                """
+                INSERT INTO users (registration_id, name, created_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                (clean_registration, clean_name),
             )
             return int(cursor.lastrowid)
+
+    def delete_user(self, identifier: str) -> Optional[sqlite3.Row]:
+        return self.delete_user_by_registration_id(identifier)
+
+    def delete_user_by_registration_id(self, registration_id: str) -> Optional[sqlite3.Row]:
+        user = self.get_user_by_registration(registration_id)
+        if user is None:
+            return None
+
+        with self.conn:
+            self.conn.execute("DELETE FROM face_embeddings WHERE user_id = ?", (int(user["user_id"]),))
+            self.conn.execute("DELETE FROM users WHERE user_id = ?", (int(user["user_id"]),))
+        return user
 
     def add_embedding(self, user_id: int, pose: str, embedding: np.ndarray) -> int:
         encrypted = self.crypto.encrypt_embedding(normalize_embedding(embedding))
@@ -428,6 +562,7 @@ class SecureFaceDB:
             SELECT
                 fe.sample_id,
                 fe.user_id,
+                COALESCE(u.registration_id, CAST(u.user_id AS TEXT)) AS registration_id,
                 u.name AS user_name,
                 fe.pose,
                 fe.embedding,
@@ -442,10 +577,14 @@ class SecureFaceDB:
         for row in rows:
             try:
                 embedding = normalize_embedding(self.crypto.decrypt_embedding(row["embedding"]))
+                if embedding.shape[0] != 512:
+                    logging.warning("Ignorando sample_id=%s com tamanho de embedding invalido: %s", row["sample_id"], embedding.shape)
+                    continue
                 samples.append(
                     FaceSample(
                         sample_id=int(row["sample_id"]),
                         user_id=int(row["user_id"]),
+                        registration_id=str(row["registration_id"]),
                         user_name=str(row["user_name"]),
                         pose=str(row["pose"]),
                         embedding=embedding,
@@ -480,6 +619,14 @@ class EmbeddingCache:
         self.by_user = dict(grouped)
         self.last_refresh = now
         logging.info("Cache atualizado: %s usuário(s), %s amostra(s)", len(self.by_user), sum(len(v) for v in self.by_user.values()))
+
+    @property
+    def user_count(self) -> int:
+        return len(self.by_user)
+
+    @property
+    def sample_count(self) -> int:
+        return sum(len(samples) for samples in self.by_user.values())
 
 
 class FaceEngine:
@@ -667,6 +814,7 @@ class FaceEngine:
             best_effective_distance = float("inf")
             best_pose = "front"
             best_name = samples[0].user_name
+            best_registration = samples[0].registration_id
 
             for sample in samples:
                 raw_distance = float(np.linalg.norm(embedding - sample.embedding))
@@ -678,6 +826,7 @@ class FaceEngine:
 
             candidate = MatchCandidate(
                 user_id=user_id,
+                registration_id=best_registration,
                 user_name=best_name,
                 distance=best_raw_distance,
                 effective_distance=best_effective_distance,
@@ -710,68 +859,80 @@ class TemporalVoteWindow:
 
     def decide(self) -> TemporalDecision:
         total_frames = len(self.votes)
-        if total_frames == 0:
-            return TemporalDecision(status="empty", message="Sem frames válidos")
+        if total_frames < self.config.min_valid_frames:
+            return TemporalDecision(status="collecting", total_frames=total_frames, message="Coletando frames validos")
 
         matched_votes = [vote for vote in self.votes if vote.user_id is not None]
         all_best_distances = [vote.best_distance for vote in self.votes if np.isfinite(vote.best_distance)]
 
         if not matched_votes:
             mean_distance = float(np.mean(all_best_distances)) if all_best_distances else float("inf")
+            best_distance = float(np.min(all_best_distances)) if all_best_distances else float("inf")
             if mean_distance >= self.config.unknown_distance_threshold or not all_best_distances:
                 return TemporalDecision(
                     status="unknown",
                     total_frames=total_frames,
                     mean_distance=mean_distance,
+                    best_distance=best_distance,
                     message="Nova face detectada",
                 )
             return TemporalDecision(
                 status="uncertain",
                 total_frames=total_frames,
                 mean_distance=mean_distance,
-                message="Sem confiança suficiente para reconhecer",
+                best_distance=best_distance,
+                message="Baixa confianca",
             )
 
         counter = Counter(vote.user_id for vote in matched_votes if vote.user_id is not None)
         winner_id, winner_votes = counter.most_common(1)[0]
         winner_frames = [vote for vote in matched_votes if vote.user_id == winner_id]
         mean_distance = float(np.mean([vote.distance for vote in winner_frames]))
+        best_distance = float(np.min([vote.distance for vote in winner_frames]))
         vote_ratio = winner_votes / max(total_frames, 1)
         user_name = winner_frames[0].user_name
+        registration_id = winner_frames[0].registration_id
 
         if (
-            winner_votes >= self.config.min_confirm_votes
+            total_frames >= self.config.min_valid_frames
+            and winner_votes >= self.config.min_confirm_votes
             and vote_ratio >= self.config.min_vote_ratio
             and mean_distance <= self.config.final_distance_threshold
+            and best_distance <= (self.config.final_distance_threshold + self.config.distance_margin)
         ):
             return TemporalDecision(
                 status="confirmed",
                 user_id=winner_id,
+                registration_id=registration_id,
                 user_name=user_name,
                 votes=winner_votes,
                 total_frames=total_frames,
                 vote_ratio=vote_ratio,
                 mean_distance=mean_distance,
+                best_distance=best_distance,
                 message=f"Encontrado: {user_name}",
             )
 
-        best_distance = float(np.mean(all_best_distances)) if all_best_distances else float("inf")
-        if best_distance >= self.config.unknown_distance_threshold:
+        mean_best_distance = float(np.mean(all_best_distances)) if all_best_distances else float("inf")
+        if mean_best_distance >= self.config.unknown_distance_threshold:
             return TemporalDecision(
                 status="unknown",
                 total_frames=total_frames,
-                mean_distance=best_distance,
+                mean_distance=mean_best_distance,
+                best_distance=float(np.min(all_best_distances)) if all_best_distances else float("inf"),
                 message="Nova face detectada",
             )
 
         return TemporalDecision(
             status="uncertain",
             user_id=winner_id,
+            registration_id=registration_id,
             user_name=user_name,
             votes=winner_votes,
             total_frames=total_frames,
             vote_ratio=vote_ratio,
             mean_distance=mean_distance,
+            best_distance=best_distance,
             message="Ainda sem consenso suficiente",
         )
 
@@ -996,9 +1157,10 @@ class FaceRecognitionApp:
 
         y = start_y
         for line in lines:
-            (text_width, text_height), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+            safe_line = text_for_opencv(line)
+            (text_width, text_height), _ = cv2.getTextSize(safe_line, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
             cv2.rectangle(frame, (10, y - 18), (20 + text_width, y + 8), (0, 0, 0), -1)
-            cv2.putText(frame, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2, cv2.LINE_AA)
+            cv2.putText(frame, safe_line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2, cv2.LINE_AA)
             y += 28
 
     def _draw_detection_overlay(self, frame: np.ndarray, detection: FaceDetection, extra_lines: List[str]) -> None:
@@ -1007,7 +1169,7 @@ class FaceRecognitionApp:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
             cv2.putText(
                 frame,
-                f"pose: {POSE_LABELS[detection.pose]}",
+                text_for_opencv(f"pose: {POSE_LABELS[detection.pose]}"),
                 (x1, max(20, y1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
@@ -1029,6 +1191,7 @@ class FaceRecognitionApp:
         if candidate is None:
             return FrameVote(
                 user_id=None,
+                registration_id=None,
                 user_name=None,
                 distance=float("inf"),
                 best_distance=float("inf"),
@@ -1039,9 +1202,10 @@ class FaceRecognitionApp:
 
         return FrameVote(
             user_id=candidate.user_id if candidate.is_within_candidate_threshold else None,
+            registration_id=candidate.registration_id if candidate.is_within_candidate_threshold else None,
             user_name=candidate.user_name if candidate.is_within_candidate_threshold else None,
             distance=candidate.distance,
-            best_distance=candidate.distance,
+            best_distance=candidate.effective_distance,
             detected_pose=detected_pose,
             matched_pose=candidate.matched_pose,
             timestamp=time.time(),
@@ -1139,7 +1303,7 @@ class FaceRecognitionApp:
                 return
             captured_by_pose[pose] = average_embeddings(samples)
 
-        user_id = self.db.upsert_user(name)
+        user_id = self.db.upsert_user(name, name)
         for pose, aggregated_embedding in captured_by_pose.items():
             self.db.add_embedding(user_id, pose, aggregated_embedding)
 
@@ -1220,15 +1384,966 @@ class FaceRecognitionApp:
             self.ui.close()
 
 
+@dataclass(slots=True)
+class RegistrationSession:
+    registration_id: str
+    name: str
+    poses: Tuple[str, ...] = ("front", "left", "right")
+    pose_index: int = 0
+    current_samples: List[np.ndarray] = field(default_factory=list)
+    captured_by_pose: Dict[str, np.ndarray] = field(default_factory=dict)
+    pose_started_at: float = field(default_factory=time.time)
+    last_capture_at: float = 0.0
+
+    @property
+    def current_pose(self) -> str:
+        return self.poses[self.pose_index]
+
+    def reset_current_pose(self) -> None:
+        self.current_samples.clear()
+        self.pose_started_at = time.time()
+        self.last_capture_at = 0.0
+
+
+class CameraManager:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.backend_name = "desconhecido"
+
+    def open(self) -> None:
+        self.cap = open_camera(self.config)
+
+    @property
+    def is_open(self) -> bool:
+        return self.cap is not None and self.cap.isOpened()
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if not self.is_open or self.cap is None:
+            return False, None
+        ok, frame = self.cap.read()
+        return ok, frame
+
+    def release(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+
+class VirtualKeyboardTyper:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.last_typed_identifier: Optional[str] = None
+        self.last_typed_at = 0.0
+        self.consecutive_identifier: Optional[str] = None
+        self.consecutive_count = 0
+        self.available = False
+        self.error_message = ""
+        self.controller = None
+        self.enter_key = None
+
+        try:
+            from pynput.keyboard import Controller, Key
+
+            self.controller = Controller()
+            self.enter_key = Key.enter
+            self.available = True
+        except Exception as exc:  # pragma: no cover - depende do SO/sessao grafica
+            self.error_message = str(exc)
+            logging.exception("Falha ao inicializar pynput: %s", exc)
+
+    def type_identifier(self, identifier: str, enabled: bool) -> Tuple[bool, str]:
+        clean_identifier = identifier.strip()
+        if not enabled:
+            return False, "digitacao desativada"
+        if not self.config.type_recognized_id:
+            return False, "digitacao desativada por configuracao"
+        if not self.available or self.controller is None:
+            return False, f"pynput indisponivel: {self.error_message}"
+        if not clean_identifier:
+            return False, "identificador vazio"
+
+        if clean_identifier != self.consecutive_identifier:
+            self.consecutive_identifier = clean_identifier
+            self.consecutive_count = 0
+
+        if self.consecutive_count >= self.config.max_consecutive_typings_per_id:
+            return False, f"limite consecutivo atingido para {clean_identifier}"
+
+        now = time.time()
+        if (
+            clean_identifier == self.last_typed_identifier
+            and (now - self.last_typed_at) < self.config.type_cooldown_seconds
+        ):
+            return False, "aguardando cooldown"
+
+        self.controller.type(clean_identifier)
+        if self.config.press_enter_after_typing and self.enter_key is not None:
+            self.controller.press(self.enter_key)
+            self.controller.release(self.enter_key)
+
+        self.last_typed_identifier = clean_identifier
+        self.last_typed_at = now
+        self.consecutive_count += 1
+        return True, f"ID digitado: {clean_identifier}"
+
+    def reset_consecutive_state(self) -> None:
+        self.consecutive_identifier = None
+        self.consecutive_count = 0
+
+    def reset_typing_session(self) -> None:
+        self.reset_consecutive_state()
+        self.last_typed_identifier = None
+        self.last_typed_at = 0.0
+
+
+class MainApp:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.config.data_dir.mkdir(parents=True, exist_ok=True)
+
+        self.crypto = CryptoManager(config.key_path)
+        self.db = SecureFaceDB(config.db_path, self.crypto)
+        self.cache = EmbeddingCache(self.db, ttl_seconds=config.cache_ttl_seconds)
+        self.cache.refresh(force=True)
+        self.engine = FaceEngine(config)
+        self.camera = CameraManager(config)
+        self.temporal_window = TemporalVoteWindow(config)
+        self.keyboard_typer = VirtualKeyboardTyper(config)
+
+        self.root = tk.Tk()
+        self.root.title("Sistema de Reconhecimento Facial")
+        self.root.geometry("1120x720")
+        self.root.minsize(self.config.min_window_width, self.config.min_window_height)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.running = False
+        self.mode = "recognition"
+        self.registration_session: Optional[RegistrationSession] = None
+        self.video_image: Optional[ImageTk.PhotoImage] = None
+        self.sidebar_visible = True
+        self.delete_window: Optional[tk.Toplevel] = None
+        self.last_face_seen_at = 0.0
+        self.status_message = "Inicializando"
+        self.status_color = (0, 220, 255)
+        self.status_until = 0.0
+
+        self.typing_enabled_var = tk.BooleanVar(value=config.type_recognized_id and self.keyboard_typer.available)
+        self.enter_typing_enabled_var = tk.BooleanVar(value=config.press_enter_after_typing and self.typing_enabled_var.get())
+        self.status_vars: Dict[str, tk.StringVar] = {}
+        self._build_layout()
+        self._refresh_database_status()
+        self._update_typing_status()
+
+    def _build_layout(self) -> None:
+        self._configure_styles()
+        self.root.configure(bg="#f3f6f8")
+        self.root.columnconfigure(0, weight=1)
+        self.root.columnconfigure(1, weight=0)
+        self.root.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self.root, style="Header.TFrame", padding=(14, 10))
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.columnconfigure(0, weight=1)
+
+        ttk.Label(header, text="Sistema de Reconhecimento Facial", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Modulo unico: reconhecimento facial local com webcam", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.header_status_var = tk.StringVar(value="Status: inicializando")
+        ttk.Label(header, textvariable=self.header_status_var, style="HeaderStatus.TLabel").grid(row=0, column=1, rowspan=2, sticky="e")
+
+        self.camera_frame = tk.Frame(self.root, bg="#05070a", highlightthickness=0)
+        self.camera_frame.grid(row=1, column=0, sticky="nsew")
+        self.camera_frame.rowconfigure(0, weight=1)
+        self.camera_frame.columnconfigure(0, weight=1)
+
+        self.video_label = tk.Label(self.camera_frame, bg="#05070a", bd=0)
+        self.video_label.grid(row=0, column=0, sticky="nsew")
+
+        self.sidebar = ttk.Frame(self.root, style="Sidebar.TFrame", padding=(10, 10), width=self.config.sidebar_width)
+        self.sidebar.grid(row=1, column=1, sticky="ns")
+        self.sidebar.grid_propagate(False)
+        self.sidebar.columnconfigure(0, weight=1)
+
+        ttk.Label(self.sidebar, text="Ações do operador", style="Section.TLabel").grid(row=0, column=0, sticky="ew")
+        self.register_button = self._make_sidebar_button(
+            "Cadastrar pessoa",
+            self.start_registration,
+            self.config.register_button_color,
+        )
+        self.register_button.grid(row=1, column=0, sticky="ew", pady=(10, 6))
+        self.delete_button = self._make_sidebar_button(
+            "Excluir pessoa",
+            self.delete_user,
+            self.config.delete_button_color,
+        )
+        self.delete_button.grid(row=2, column=0, sticky="ew", pady=6)
+        self.typing_check = tk.Checkbutton(
+            self.sidebar,
+            text="Digitar ID automaticamente",
+            variable=self.typing_enabled_var,
+            command=self._update_typing_status,
+            bg=self.config.sidebar_color,
+            fg="#ffffff",
+            activebackground=self.config.sidebar_color,
+            activeforeground="#ffffff",
+            selectcolor=self.config.sidebar_color,
+            font=("Segoe UI", 9),
+            anchor="w",
+            relief="flat",
+            highlightthickness=0,
+        )
+        self.typing_check.grid(row=3, column=0, sticky="w", pady=6)
+        self.enter_typing_check = tk.Checkbutton(
+            self.sidebar,
+            text="Digitar Enter automaticamente",
+            variable=self.enter_typing_enabled_var,
+            command=self._update_typing_status,
+            bg=self.config.sidebar_color,
+            fg="#ffffff",
+            activebackground=self.config.sidebar_color,
+            activeforeground="#ffffff",
+            selectcolor=self.config.sidebar_color,
+            font=("Segoe UI", 9),
+            anchor="w",
+            relief="flat",
+            highlightthickness=0,
+        )
+        self.enter_typing_check.grid(row=4, column=0, sticky="w", pady=(0, 6))
+        self.close_button = self._make_sidebar_button("Fechar app", self.close, self.config.close_button_color)
+        self.close_button.grid(row=5, column=0, sticky="ew", pady=(6, 14))
+
+        tk.Frame(self.sidebar, bg="#415061", height=1).grid(row=6, column=0, sticky="ew", pady=(2, 12))
+        ttk.Label(self.sidebar, text="Status", style="Section.TLabel").grid(row=7, column=0, sticky="ew")
+
+        status_frame = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
+        status_frame.grid(row=8, column=0, sticky="nsew", pady=(8, 0))
+        status_frame.columnconfigure(1, weight=1)
+        self.sidebar.rowconfigure(8, weight=1)
+
+        rows = [
+            ("camera", "Câmera"),
+            ("database", "Banco"),
+            ("recognized_user", "Usuário"),
+            ("recognized_id", "ID/matricula"),
+            ("pose", "Pose"),
+            ("distance", "Distância média"),
+            ("frames", "Frames válidos"),
+            ("typing", "Digitação"),
+            ("operator", "Operação"),
+        ]
+        for index, (key, label) in enumerate(rows):
+            self._add_status_row(status_frame, index, key, label)
+
+        self.root.bind("<Configure>", self._on_root_resize)
+        self.root.bind("<Escape>", lambda _event: self.cancel_registration() if self.mode == "registering" else self.close())
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure("Header.TFrame", background=self.config.header_color)
+        style.configure("Sidebar.TFrame", background=self.config.sidebar_color)
+        style.configure("Title.TLabel", background=self.config.header_color, foreground="#ffffff", font=("Segoe UI", 17, "bold"))
+        style.configure("Subtitle.TLabel", background=self.config.header_color, foreground="#d9e2ec", font=("Segoe UI", 9))
+        style.configure("HeaderStatus.TLabel", background=self.config.header_color, foreground="#b6f0c2", font=("Segoe UI", 9, "bold"))
+        style.configure("Section.TLabel", background=self.config.sidebar_color, foreground="#ffffff", font=("Segoe UI", 11, "bold"))
+        style.configure("StatusName.TLabel", background=self.config.sidebar_color, foreground="#d9e2ec", font=("Segoe UI", 9))
+        style.configure("StatusValue.TLabel", background=self.config.sidebar_color, foreground="#ffffff", font=("Segoe UI", 9, "bold"), wraplength=135)
+        style.configure("TButton", font=("Segoe UI", 10), padding=(10, 7))
+        style.configure("TCheckbutton", background=self.config.sidebar_color, foreground="#ffffff", font=("Segoe UI", 9))
+
+    def _make_sidebar_button(self, text: str, command, background: str) -> tk.Button:
+        return tk.Button(
+            self.sidebar,
+            text=text,
+            command=command,
+            bg=background,
+            fg=self.config.button_text_color,
+            activebackground=background,
+            activeforeground=self.config.button_text_color,
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=8,
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+            highlightthickness=0,
+        )
+
+    def _add_status_row(self, parent: ttk.Frame, row: int, key: str, label: str) -> None:
+        self.status_vars[key] = tk.StringVar(value="-")
+        ttk.Label(parent, text=label, style="StatusName.TLabel").grid(row=row, column=0, sticky="nw", padx=(0, 6), pady=4)
+        ttk.Label(parent, textvariable=self.status_vars[key], style="StatusValue.TLabel").grid(row=row, column=1, sticky="ew", pady=4)
+
+    def _on_root_resize(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
+        if event.width < self.config.sidebar_hide_width and self.sidebar_visible:
+            self.sidebar.grid_remove()
+            self.sidebar_visible = False
+        elif event.width >= self.config.sidebar_show_width and not self.sidebar_visible:
+            self.sidebar.grid()
+            self.sidebar_visible = True
+
+    def start(self) -> None:
+        self.running = True
+        try:
+            self.camera.open()
+            self.status_vars["camera"].set("ativa")
+            self._set_status("Camera ativa / banco conectado / reconhecendo", (0, 220, 0), duration=2.0)
+        except Exception as exc:
+            self.status_vars["camera"].set("indisponivel")
+            self._set_status("Camera indisponivel", (0, 0, 255), duration=5.0)
+            messagebox.showerror("Erro de camera", f"Nao foi possivel abrir a webcam.\n\n{exc}", parent=self.root)
+
+        self.root.after(10, self._video_loop)
+        self.root.mainloop()
+
+    def _video_loop(self) -> None:
+        if not self.running:
+            return
+
+        if not self.camera.is_open:
+            frame = self._blank_frame("Camera indisponivel")
+            detection = FaceDetection(found=False, feedback="Camera indisponivel")
+            self._draw_detection_overlay(frame, detection, ["Verifique se a webcam esta conectada"])
+            self._show_frame(frame)
+            self.root.after(250, self._video_loop)
+            return
+
+        self.cache.refresh()
+        ok, frame = self.camera.read()
+        if not ok or frame is None:
+            self.status_vars["camera"].set("erro de leitura")
+            frame = self._blank_frame("Erro ao ler webcam")
+            detection = FaceDetection(found=False, feedback="Erro ao ler webcam")
+            self._draw_detection_overlay(frame, detection, ["Tentando ler o proximo frame"])
+            self._show_frame(frame)
+            self.root.after(80, self._video_loop)
+            return
+
+        detection = self.engine.analyze_frame(frame)
+        extra_lines: List[str] = []
+        self._update_detection_status(detection)
+
+        if self.mode == "registering":
+            self._process_registration_frame(detection, extra_lines)
+        else:
+            self._process_recognition_frame(detection, extra_lines)
+
+        self._draw_detection_overlay(frame, detection, extra_lines)
+        self._show_frame(frame)
+        self.root.after(10, self._video_loop)
+
+    def _process_recognition_frame(self, detection: FaceDetection, extra_lines: List[str]) -> None:
+        self.status_vars["operator"].set("reconhecendo")
+        if detection.found:
+            self.last_face_seen_at = time.time()
+            extra_lines.append(detection.feedback)
+
+            if detection.embedding is None:
+                self._reset_typing_when_waiting()
+                extra_lines.append("Aguardando frame melhor")
+                return
+
+            candidate = self.engine.match_embedding(detection.embedding, detection.pose, self.cache.by_user)
+            vote = self._make_vote(candidate, detection.pose)
+            self.temporal_window.add_vote(vote)
+            current_votes, target_votes = self.temporal_window.progress()
+            self.status_vars["frames"].set(f"{current_votes}/{target_votes}")
+            extra_lines.append(f"Reconhecendo: {current_votes}/{target_votes} frames")
+
+            if candidate is None:
+                extra_lines.append("Base vazia. Cadastre a primeira pessoa.")
+            else:
+                label = "candidato" if candidate.is_within_candidate_threshold else "baixo consenso"
+                extra_lines.append(
+                    f"{label}: {candidate.registration_id} | dist={candidate.distance:.3f} | pose={POSE_LABELS[candidate.matched_pose]}"
+                )
+
+            if self.temporal_window.ready():
+                decision = self.temporal_window.decide()
+                self._handle_decision(decision)
+                self.temporal_window.reset()
+            return
+
+        extra_lines.append(detection.feedback)
+        self._reset_typing_when_waiting()
+        if (time.time() - self.last_face_seen_at) > 1.2:
+            self.temporal_window.reset()
+            self.status_vars["frames"].set("0/{0}".format(self.config.temporal_window))
+
+    def _reset_typing_when_waiting(self) -> None:
+        self.keyboard_typer.reset_typing_session()
+
+    def _make_vote(self, candidate: Optional[MatchCandidate], detected_pose: str) -> FrameVote:
+        if candidate is None:
+            return FrameVote(
+                user_id=None,
+                registration_id=None,
+                user_name=None,
+                distance=float("inf"),
+                best_distance=float("inf"),
+                detected_pose=detected_pose,
+                matched_pose=None,
+                timestamp=time.time(),
+            )
+
+        accepted = candidate.is_within_candidate_threshold
+        return FrameVote(
+            user_id=candidate.user_id if accepted else None,
+            registration_id=candidate.registration_id if accepted else None,
+            user_name=candidate.user_name if accepted else None,
+            distance=candidate.distance,
+            best_distance=candidate.effective_distance,
+            detected_pose=detected_pose,
+            matched_pose=candidate.matched_pose,
+            timestamp=time.time(),
+        )
+
+    def _handle_decision(self, decision: TemporalDecision) -> None:
+        if decision.status == "confirmed" and decision.registration_id:
+            self.status_vars["recognized_user"].set(decision.user_name or "-")
+            self.status_vars["recognized_id"].set(decision.registration_id)
+            self.status_vars["distance"].set(f"{decision.mean_distance:.3f}")
+            self.status_vars["frames"].set(f"{decision.votes}/{decision.total_frames}")
+            self._set_status(
+                f"Encontrado: {decision.user_name} ({decision.registration_id})",
+                (0, 220, 0),
+                duration=3.0,
+            )
+            typed, typing_message = self.keyboard_typer.type_identifier(
+                decision.registration_id,
+                enabled=self.typing_enabled_var.get() and self.mode == "recognition",
+            )
+            self.status_vars["typing"].set(typing_message)
+            if typed:
+                logging.info("Identificador digitado via pynput: %s", decision.registration_id)
+            return
+
+        if decision.status == "unknown":
+            self.status_vars["recognized_user"].set("nova face")
+            self.status_vars["recognized_id"].set("-")
+            self.status_vars["distance"].set(self._format_distance(decision.mean_distance))
+            self._set_status("Nova face detectada", (0, 165, 255), duration=3.0)
+            return
+
+        self.status_vars["distance"].set(self._format_distance(decision.mean_distance))
+        self._set_status("Baixa confianca. Continue olhando para a camera.", (0, 220, 255), duration=2.0)
+
+    def start_registration(self) -> None:
+        if self.mode != "recognition":
+            messagebox.showinfo("Operacao em andamento", "Finalize ou cancele o cadastro atual antes de iniciar outro.", parent=self.root)
+            return
+        if not self.camera.is_open:
+            messagebox.showerror("Camera indisponivel", "A webcam precisa estar ativa para cadastrar uma pessoa.", parent=self.root)
+            return
+
+        registration_id = simpledialog.askstring("Cadastrar pessoa", "Digite o ID ou matricula:", parent=self.root)
+        if registration_id is None:
+            return
+        registration_id = registration_id.strip()
+        if not registration_id:
+            messagebox.showerror("ID invalido", "O ID/matricula nao pode ficar vazio.", parent=self.root)
+            return
+
+        name = simpledialog.askstring("Cadastrar pessoa", "Digite o nome da pessoa:", parent=self.root)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showerror("Nome invalido", "O nome nao pode ficar vazio.", parent=self.root)
+            return
+
+        existing_user = self.db.get_user_by_registration(registration_id)
+        if existing_user:
+            should_extend = messagebox.askyesno(
+                "Pessoa ja cadastrada",
+                f"A matricula {registration_id} ja existe para {existing_user['name']}.\nDeseja adicionar novas amostras?",
+                parent=self.root,
+            )
+            if not should_extend:
+                return
+
+        self.mode = "registering"
+        self.registration_session = RegistrationSession(registration_id=registration_id, name=name)
+        self.temporal_window.reset()
+        self._set_action_buttons_enabled(False)
+        self._set_status("Cadastro iniciado: pose frente", (0, 220, 255), duration=3.0)
+        self.status_vars["operator"].set("cadastro: frente")
+        self.status_vars["recognized_user"].set(name)
+        self.status_vars["recognized_id"].set(registration_id)
+        self.status_vars["frames"].set(f"0/{self.config.samples_per_pose}")
+        self._show_pose_popup("front")
+
+    def cancel_registration(self) -> None:
+        if self.mode != "registering":
+            return
+        self.mode = "recognition"
+        self.registration_session = None
+        self._set_action_buttons_enabled(True)
+        self.temporal_window.reset()
+        self._set_status("Cadastro cancelado", (0, 165, 255), duration=2.0)
+        self.status_vars["operator"].set("reconhecendo")
+
+    def _process_registration_frame(self, detection: FaceDetection, extra_lines: List[str]) -> None:
+        session = self.registration_session
+        if session is None:
+            self.mode = "recognition"
+            return
+
+        pose = session.current_pose
+        pose_label = POSE_LABELS[pose]
+        elapsed = time.time() - session.pose_started_at
+        remaining = max(self.config.pose_capture_timeout - elapsed, 0.0)
+        collected = len(session.current_samples)
+
+        self.status_vars["operator"].set(f"cadastro: {pose_label}")
+        self.status_vars["frames"].set(f"{collected}/{self.config.samples_per_pose}")
+        extra_lines.append(f"Cadastro: {pose_label}")
+        extra_lines.append(f"Amostras: {collected}/{self.config.samples_per_pose}")
+        extra_lines.append(f"Tempo restante: {remaining:.1f}s")
+
+        if not detection.found:
+            extra_lines.append("Centralize o rosto")
+        elif detection.pose != pose:
+            extra_lines.append(f"Pose atual: {POSE_LABELS[detection.pose]}")
+            extra_lines.append(f"Ajuste para: {pose_label}")
+        elif detection.embedding is None:
+            extra_lines.append(detection.feedback)
+        else:
+            now = time.time()
+            if now - session.last_capture_at >= self.config.sample_capture_interval:
+                session.current_samples.append(detection.embedding)
+                session.last_capture_at = now
+                extra_lines.append("Frame valido capturado")
+            else:
+                extra_lines.append("Mantenha a pose")
+
+        if len(session.current_samples) >= self.config.samples_per_pose:
+            self._accept_current_registration_pose()
+            return
+
+        if elapsed >= self.config.pose_capture_timeout:
+            if len(session.current_samples) >= self.config.min_samples_per_pose:
+                self._accept_current_registration_pose()
+            else:
+                self._fail_registration(
+                    f"Nao foi possivel capturar amostras suficientes para {pose_label}. "
+                    f"Minimo: {self.config.min_samples_per_pose}."
+                )
+
+    def _accept_current_registration_pose(self) -> None:
+        session = self.registration_session
+        if session is None:
+            return
+
+        pose = session.current_pose
+        session.captured_by_pose[pose] = average_embeddings(session.current_samples)
+        session.pose_index += 1
+
+        if session.pose_index >= len(session.poses):
+            self._complete_registration()
+            return
+
+        next_pose = session.current_pose
+        session.reset_current_pose()
+        self._set_status(f"Cadastro: agora vire para {POSE_LABELS[next_pose]}", (0, 220, 255), duration=3.0)
+        self.status_vars["operator"].set(f"cadastro: {POSE_LABELS[next_pose]}")
+        self.status_vars["frames"].set(f"0/{self.config.samples_per_pose}")
+        self._show_pose_popup(next_pose)
+
+    def _complete_registration(self) -> None:
+        session = self.registration_session
+        if session is None:
+            return
+
+        try:
+            user_id = self.db.upsert_user(session.registration_id, session.name)
+            for pose, embedding in session.captured_by_pose.items():
+                self.db.add_embedding(user_id, pose, embedding)
+
+            self.cache.refresh(force=True)
+            self._refresh_database_status()
+            self.temporal_window.reset()
+            self._set_status("Cadastro concluido", (0, 220, 0), duration=3.0)
+            messagebox.showinfo(
+                "Cadastro concluido",
+                f"Cadastro concluído com sucesso.\n\n{session.name} ({session.registration_id}) foi cadastrado com amostras front/left/right.",
+                parent=self.root,
+            )
+        except sqlite3.IntegrityError as exc:
+            messagebox.showerror("Erro ao salvar", f"Nao foi possivel salvar o cadastro.\n\n{exc}", parent=self.root)
+            logging.exception("Erro de integridade ao salvar cadastro: %s", exc)
+        finally:
+            self.mode = "recognition"
+            self.registration_session = None
+            self._set_action_buttons_enabled(True)
+            self.status_vars["operator"].set("reconhecendo")
+
+    def _fail_registration(self, message: str) -> None:
+        self.mode = "recognition"
+        self.registration_session = None
+        self._set_action_buttons_enabled(True)
+        self.temporal_window.reset()
+        self._set_status("Cadastro falhou", (0, 0, 255), duration=3.0)
+        self.status_vars["operator"].set("reconhecendo")
+        messagebox.showerror("Cadastro falhou", message, parent=self.root)
+
+    def _show_pose_popup(self, pose: str) -> None:
+        message = POSE_POPUP_MESSAGES.get(pose)
+        if not message:
+            return
+        messagebox.showinfo("Cadastro guiado", message, parent=self.root)
+
+    def delete_user(self) -> None:
+        if self.mode != "recognition":
+            messagebox.showinfo("Operacao em andamento", "Finalize ou cancele o cadastro antes de excluir uma pessoa.", parent=self.root)
+            return
+
+        if self.delete_window is not None and self.delete_window.winfo_exists():
+            self.delete_window.lift()
+            self.delete_window.focus_force()
+            return
+
+        self.delete_window = tk.Toplevel(self.root)
+        self.delete_window.title("Excluir pessoa")
+        self.delete_window.geometry("520x430")
+        self.delete_window.minsize(360, 300)
+        self.delete_window.configure(bg=self.config.sidebar_color)
+        self.delete_window.transient(self.root)
+        self.delete_window.grab_set()
+        self.delete_window.columnconfigure(0, weight=1)
+        self.delete_window.rowconfigure(3, weight=1)
+
+        search_var = tk.StringVar()
+        registration_var = tk.StringVar()
+        display_users: List[sqlite3.Row] = []
+
+        title = tk.Label(
+            self.delete_window,
+            text="Excluir usuário por ID/matrícula",
+            bg=self.config.sidebar_color,
+            fg="#ffffff",
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        )
+        title.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
+
+        search_frame = tk.Frame(self.delete_window, bg=self.config.sidebar_color)
+        search_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        search_frame.columnconfigure(0, weight=1)
+        tk.Label(
+            search_frame,
+            text="Buscar por ID/matrícula",
+            bg=self.config.sidebar_color,
+            fg="#d9e2ec",
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        search_entry = tk.Entry(search_frame, textvariable=search_var, font=("Segoe UI", 10))
+        search_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        selected_frame = tk.Frame(self.delete_window, bg=self.config.sidebar_color)
+        selected_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
+        selected_frame.columnconfigure(0, weight=1)
+        tk.Label(
+            selected_frame,
+            text="ID/matrícula selecionado",
+            bg=self.config.sidebar_color,
+            fg="#d9e2ec",
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        registration_entry = tk.Entry(selected_frame, textvariable=registration_var, font=("Segoe UI", 10))
+        registration_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        list_frame = tk.Frame(self.delete_window, bg=self.config.sidebar_color)
+        list_frame.grid(row=3, column=0, sticky="nsew", padx=14, pady=(0, 10))
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        user_listbox = tk.Listbox(
+            list_frame,
+            activestyle="dotbox",
+            bg="#f8fafc",
+            fg="#17202a",
+            selectbackground="#A7C7E7",
+            selectforeground="#17202a",
+            font=("Segoe UI", 10),
+            height=8,
+            exportselection=False,
+        )
+        user_listbox.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=user_listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        user_listbox.configure(yscrollcommand=scrollbar.set)
+
+        button_frame = tk.Frame(self.delete_window, bg=self.config.sidebar_color)
+        button_frame.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 14))
+        button_frame.columnconfigure(0, weight=1)
+        delete_button = tk.Button(
+            button_frame,
+            text="Excluir usuário selecionado",
+            bg=self.config.delete_button_color,
+            fg=self.config.button_text_color,
+            activebackground=self.config.delete_button_color,
+            activeforeground=self.config.button_text_color,
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=8,
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+            command=lambda: confirm_delete(),
+        )
+        delete_button.grid(row=0, column=0, sticky="ew")
+
+        def user_label(user: sqlite3.Row) -> str:
+            return f"{user['name']} — {user['registration_id']}"
+
+        def refresh_user_list() -> None:
+            nonlocal display_users
+            query = search_var.get().strip().lower()
+            users = self.db.list_users()
+            display_users = [
+                user for user in users if not query or query in str(user["registration_id"]).lower()
+            ]
+
+            user_listbox.delete(0, tk.END)
+            if not display_users:
+                user_listbox.insert(tk.END, "Nenhum usuário encontrado")
+                return
+
+            for user in display_users:
+                user_listbox.insert(tk.END, user_label(user))
+
+        def fill_selected_registration(_event: Optional[tk.Event] = None) -> None:
+            selection = user_listbox.curselection()
+            if not selection or not display_users:
+                return
+            index = selection[0]
+            if index >= len(display_users):
+                return
+            registration_var.set(str(display_users[index]["registration_id"]))
+
+        def confirm_delete() -> None:
+            registration_id = registration_var.get().strip()
+            if not registration_id:
+                messagebox.showerror("Matrícula obrigatória", "Informe ou selecione um ID/matrícula para excluir.", parent=self.delete_window)
+                return
+
+            user = self.db.get_user_by_registration(registration_id)
+            if user is None:
+                messagebox.showerror("Usuário não encontrado", "Nenhum usuário cadastrado possui essa matrícula.", parent=self.delete_window)
+                return
+
+            user_text = f"{user['name']} — {user['registration_id']}"
+            confirmed = messagebox.askyesno(
+                "Confirmar exclusão",
+                f"Tem certeza que deseja excluir o usuário {user_text}?",
+                parent=self.delete_window,
+            )
+            if not confirmed:
+                return
+
+            deleted = self.db.delete_user_by_registration_id(registration_id)
+            if deleted is None:
+                messagebox.showerror("Usuário não encontrado", "A matrícula informada não existe mais no banco.", parent=self.delete_window)
+                return
+
+            self.cache.refresh(force=True)
+            self._refresh_database_status()
+            self.temporal_window.reset()
+            self.status_vars["recognized_user"].set("-")
+            self.status_vars["recognized_id"].set("-")
+            registration_var.set("")
+            refresh_user_list()
+            self._set_status("Pessoa excluida", (0, 220, 0), duration=3.0)
+            messagebox.showinfo("Pessoa excluída", f"Usuário {user_text} excluído com sucesso.", parent=self.delete_window)
+
+        def close_delete_window() -> None:
+            if self.delete_window is not None:
+                try:
+                    self.delete_window.grab_release()
+                    self.delete_window.destroy()
+                except tk.TclError:
+                    pass
+                self.delete_window = None
+
+        search_var.trace_add("write", lambda *_args: refresh_user_list())
+        user_listbox.bind("<<ListboxSelect>>", fill_selected_registration)
+        self.delete_window.protocol("WM_DELETE_WINDOW", close_delete_window)
+        refresh_user_list()
+        search_entry.focus_set()
+
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.register_button.configure(state=state)
+        self.delete_button.configure(state=state)
+
+    def _update_detection_status(self, detection: FaceDetection) -> None:
+        if detection.found:
+            self.status_vars["pose"].set(POSE_LABELS[detection.pose])
+        else:
+            self.status_vars["pose"].set("aguardando")
+
+    def _refresh_database_status(self) -> None:
+        self.status_vars["database"].set(f"conectado: {self.cache.user_count} usuario(s), {self.cache.sample_count} amostra(s)")
+
+    def _update_typing_status(self) -> None:
+        enabled = self.typing_enabled_var.get()
+        if enabled and not self.keyboard_typer.available:
+            self.typing_enabled_var.set(False)
+            enabled = False
+        if not enabled:
+            self.enter_typing_enabled_var.set(False)
+        self._update_enter_typing_status()
+        if enabled:
+            enter_status = "com Enter" if self.config.press_enter_after_typing else "sem Enter"
+            self.status_vars["typing"].set(
+                f"ativa, {enter_status}, max {self.config.max_consecutive_typings_per_id} por ID, cooldown {self.config.type_cooldown_seconds:.1f}s"
+            )
+        elif not self.keyboard_typer.available:
+            self.status_vars["typing"].set("indisponivel")
+        else:
+            self.status_vars["typing"].set("desativada")
+
+    def _update_enter_typing_status(self) -> None:
+        typing_enabled = self.typing_enabled_var.get()
+        if not typing_enabled:
+            self.enter_typing_enabled_var.set(False)
+        self.config.press_enter_after_typing = bool(self.enter_typing_enabled_var.get() and typing_enabled)
+        state = "normal" if typing_enabled else "disabled"
+        if hasattr(self, "enter_typing_check"):
+            self.enter_typing_check.configure(state=state)
+
+    def _set_status(self, message: str, color: Tuple[int, int, int], duration: float = 1.5) -> None:
+        self.status_message = message
+        self.status_color = color
+        self.status_until = time.time() + duration
+        self.header_status_var.set(f"Status: {message}")
+
+    def _active_status(self) -> Tuple[str, Tuple[int, int, int]]:
+        if time.time() <= self.status_until:
+            return self.status_message, self.status_color
+        return "Procurando rosto", (0, 220, 255)
+
+    def _draw_detection_overlay(self, frame: np.ndarray, detection: FaceDetection, extra_lines: List[str]) -> None:
+        if detection.found and detection.box is not None:
+            x1, y1, x2, y2 = detection.box
+            box_color = (0, 220, 0) if detection.embedding is not None else (0, 190, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+            cv2.putText(
+                frame,
+                text_for_opencv(f"pose: {POSE_LABELS[detection.pose]}"),
+                (x1, max(24, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                box_color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        status_message, status_color = self._active_status()
+        lines = [status_message]
+        if detection.found:
+            lines.append(f"Pose detectada: {POSE_LABELS[detection.pose]}")
+            lines.append(f"Face: {detection.face_ratio:.3f} | Nitidez: {detection.sharpness:.1f}")
+        else:
+            lines.append("Pose detectada: aguardando")
+        lines.extend(extra_lines[:5])
+        self._draw_text_block(frame, lines, status_color)
+
+    def _draw_text_block(
+        self,
+        frame: np.ndarray,
+        lines: List[str],
+        color: Tuple[int, int, int],
+        start_y: int = 28,
+    ) -> None:
+        y = start_y
+        for line in lines:
+            if not line:
+                continue
+            safe_line = text_for_opencv(line)
+            (text_width, text_height), _ = cv2.getTextSize(safe_line, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)
+            cv2.rectangle(frame, (10, y - text_height - 9), (26 + text_width, y + 9), (9, 12, 17), -1)
+            cv2.putText(frame, safe_line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2, cv2.LINE_AA)
+            y += 30
+
+    def _blank_frame(self, message: str) -> np.ndarray:
+        frame = np.zeros((self.config.camera_height, self.config.camera_width, 3), dtype=np.uint8)
+        cv2.putText(frame, text_for_opencv(message), (40, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+        return frame
+
+    def _show_frame(self, frame: np.ndarray) -> None:
+        width = max(self.video_label.winfo_width(), 320)
+        height = max(self.video_label.winfo_height(), 240)
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb_frame)
+        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        image.thumbnail((width, height), resampling)
+
+        canvas = Image.new("RGB", (width, height), (5, 7, 10))
+        x = (width - image.width) // 2
+        y = (height - image.height) // 2
+        canvas.paste(image, (x, y))
+
+        self.video_image = ImageTk.PhotoImage(image=canvas)
+        self.video_label.configure(image=self.video_image)
+
+    def _format_distance(self, distance: float) -> str:
+        if not np.isfinite(distance):
+            return "-"
+        return f"{distance:.3f}"
+
+    def close(self) -> None:
+        if self.delete_window is not None:
+            try:
+                self.delete_window.destroy()
+            except tk.TclError:
+                pass
+            self.delete_window = None
+
+        if not self.running:
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass
+            return
+
+        self.running = False
+        self.camera.release()
+        cv2.destroyAllWindows()
+        self.db.close()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+
 def build_config_from_args() -> AppConfig:
     parser = argparse.ArgumentParser(description="Reconhecimento facial em tempo real com votação temporal multi-pose.")
     parser.add_argument("--camera-index", type=int, default=0, help="Índice da webcam.")
     parser.add_argument("--window-size", type=int, default=20, help="Quantidade de frames válidos na janela temporal.")
-    parser.add_argument("--min-votes", type=int, default=9, help="Número mínimo de votos para confirmar reconhecimento.")
+    parser.add_argument("--min-valid-frames", type=int, default=8, help="Quantidade minima de frames validos antes de decidir.")
+    parser.add_argument("--min-votes", type=int, default=6, help="Numero minimo de votos para confirmar reconhecimento.")
+    parser.add_argument("--min-vote-ratio", type=float, default=0.30, help="Proporcao minima de votos do vencedor na janela temporal.")
     parser.add_argument("--frame-threshold", type=float, default=1.02, help="Threshold por frame para aceitar candidato.")
     parser.add_argument("--final-threshold", type=float, default=0.90, help="Threshold médio final para confirmar o vencedor.")
     parser.add_argument("--unknown-threshold", type=float, default=1.10, help="Threshold médio para sugerir nova face.")
-    parser.add_argument("--samples-per-pose", type=int, default=12, help="Frames válidos capturados por pose no cadastro.")
+    parser.add_argument("--samples-per-pose", type=int, default=15, help="Frames validos capturados por pose no cadastro.")
+    parser.add_argument("--min-samples-per-pose", type=int, default=8, help="Minimo de frames validos aceitos por pose no cadastro.")
+    parser.add_argument("--type-cooldown", type=float, default=5.0, help="Cooldown em segundos para digitacao automatica.")
+    parser.add_argument("--max-consecutive-typings", type=int, default=1, help="Maximo de digitacoes consecutivas para o mesmo ID/matricula.")
+    parser.add_argument("--disable-auto-type", action="store_true", help="Inicia com digitacao automatica desativada.")
+    parser.add_argument("--press-enter-after-typing", action="store_true", help="Pressiona Enter apos digitar o ID reconhecido.")
+    parser.add_argument("--min-window-width", type=int, default=420, help="Largura minima da janela principal.")
+    parser.add_argument("--min-window-height", type=int, default=300, help="Altura minima da janela principal.")
     parser.add_argument("--db-path", type=str, default="", help="Caminho opcional para o banco SQLite.")
     parser.add_argument("--key-path", type=str, default="", help="Caminho opcional para a chave Fernet.")
     args = parser.parse_args()
@@ -1236,11 +2351,20 @@ def build_config_from_args() -> AppConfig:
     config = AppConfig(
         camera_index=args.camera_index,
         temporal_window=args.window_size,
+        min_valid_frames=args.min_valid_frames,
         min_confirm_votes=args.min_votes,
+        min_vote_ratio=args.min_vote_ratio,
         frame_candidate_threshold=args.frame_threshold,
         final_distance_threshold=args.final_threshold,
         unknown_distance_threshold=args.unknown_threshold,
         samples_per_pose=args.samples_per_pose,
+        min_samples_per_pose=args.min_samples_per_pose,
+        type_recognized_id=not args.disable_auto_type,
+        type_cooldown_seconds=args.type_cooldown,
+        max_consecutive_typings_per_id=args.max_consecutive_typings,
+        press_enter_after_typing=args.press_enter_after_typing,
+        min_window_width=args.min_window_width,
+        min_window_height=args.min_window_height,
     )
 
     config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -1260,8 +2384,8 @@ def main() -> None:
     for warning in collect_environment_warnings():
         logging.warning(warning)
     config = build_config_from_args()
-    app = FaceRecognitionApp(config)
-    app.run()
+    app = MainApp(config)
+    app.start()
 
 
 if __name__ == "__main__":
