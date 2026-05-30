@@ -39,6 +39,24 @@ POSE_POPUP_MESSAGES = {
     "right": "Agora vire o rosto levemente para a esquerda.",
 }
 
+CARD_CODE_MAX_LENGTH = 8
+HEX_DIGITS = set("0123456789ABCDEF")
+
+
+def normalize_card_code(value: str) -> str:
+    return value.strip().upper()
+
+
+def validate_card_code(value: str) -> Tuple[bool, str, str]:
+    card_code = normalize_card_code(value)
+    if not card_code:
+        return False, card_code, "O código do cartão não pode ficar vazio."
+    if len(card_code) > CARD_CODE_MAX_LENGTH:
+        return False, card_code, f"O código do cartão deve ter no máximo {CARD_CODE_MAX_LENGTH} dígitos."
+    if any(character not in HEX_DIGITS for character in card_code):
+        return False, card_code, "O código do cartão deve conter apenas dígitos hexadecimais: 0-9 e A-F."
+    return True, card_code, ""
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -466,7 +484,7 @@ class SecureFaceDB:
 
     def get_user_by_registration(self, registration_id: str) -> Optional[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM users WHERE registration_id = ?",
+            "SELECT * FROM users WHERE registration_id = ? COLLATE NOCASE",
             (registration_id.strip(),),
         ).fetchone()
 
@@ -1454,6 +1472,26 @@ class VirtualKeyboardTyper:
 
     def type_identifier(self, identifier: str, enabled: bool) -> Tuple[bool, str]:
         clean_identifier = identifier.strip()
+        allowed, blocked_message = self.can_type_identifier(clean_identifier, enabled)
+        if not allowed:
+            return False, blocked_message
+
+        if clean_identifier != self.consecutive_identifier:
+            self.consecutive_identifier = clean_identifier
+            self.consecutive_count = 0
+
+        self.controller.type(clean_identifier)
+        if self.config.press_enter_after_typing and self.enter_key is not None:
+            self.controller.press(self.enter_key)
+            self.controller.release(self.enter_key)
+
+        self.last_typed_identifier = clean_identifier
+        self.last_typed_at = time.time()
+        self.consecutive_count += 1
+        return True, f"Código do cartão digitado: {clean_identifier}"
+
+    def can_type_identifier(self, identifier: str, enabled: bool) -> Tuple[bool, str]:
+        clean_identifier = identifier.strip()
         if not enabled:
             return False, "digitacao desativada"
         if not self.config.type_recognized_id:
@@ -1461,14 +1499,11 @@ class VirtualKeyboardTyper:
         if not self.available or self.controller is None:
             return False, f"pynput indisponivel: {self.error_message}"
         if not clean_identifier:
-            return False, "identificador vazio"
+            return False, "código do cartão vazio"
 
-        if clean_identifier != self.consecutive_identifier:
-            self.consecutive_identifier = clean_identifier
-            self.consecutive_count = 0
-
-        if self.consecutive_count >= self.config.max_consecutive_typings_per_id:
-            return False, f"limite consecutivo atingido para {clean_identifier}"
+        consecutive_count = self.consecutive_count if clean_identifier == self.consecutive_identifier else 0
+        if consecutive_count >= self.config.max_consecutive_typings_per_id:
+            return False, f"limite de digitação atingido para {clean_identifier}"
 
         now = time.time()
         if (
@@ -1477,15 +1512,7 @@ class VirtualKeyboardTyper:
         ):
             return False, "aguardando cooldown"
 
-        self.controller.type(clean_identifier)
-        if self.config.press_enter_after_typing and self.enter_key is not None:
-            self.controller.press(self.enter_key)
-            self.controller.release(self.enter_key)
-
-        self.last_typed_identifier = clean_identifier
-        self.last_typed_at = now
-        self.consecutive_count += 1
-        return True, f"ID digitado: {clean_identifier}"
+        return True, "pronto para digitar"
 
     def reset_consecutive_state(self) -> None:
         self.consecutive_identifier = None
@@ -1523,6 +1550,10 @@ class MainApp:
         self.video_image: Optional[ImageTk.PhotoImage] = None
         self.sidebar_visible = True
         self.delete_window: Optional[tk.Toplevel] = None
+        self.typing_prompt_window: Optional[tk.Toplevel] = None
+        self.pending_typing_code: Optional[str] = None
+        self.pending_mouse_listener = None
+        self.pending_typing_due_at = 0.0
         self.last_face_seen_at = 0.0
         self.status_message = "Inicializando"
         self.status_color = (0, 220, 255)
@@ -1579,7 +1610,7 @@ class MainApp:
         self.delete_button.grid(row=2, column=0, sticky="ew", pady=6)
         self.typing_check = tk.Checkbutton(
             self.sidebar,
-            text="Digitar ID automaticamente",
+            text="Perguntar antes de digitar o código do cartão",
             variable=self.typing_enabled_var,
             command=self._update_typing_status,
             bg=self.config.sidebar_color,
@@ -1624,7 +1655,7 @@ class MainApp:
             ("camera", "Câmera"),
             ("database", "Banco"),
             ("recognized_user", "Usuário"),
-            ("recognized_id", "ID/matricula"),
+            ("recognized_id", "Código do cartão"),
             ("pose", "Pose"),
             ("distance", "Distância média"),
             ("frames", "Frames válidos"),
@@ -1706,6 +1737,8 @@ class MainApp:
         if not self.running:
             return
 
+        self._process_due_pending_typing()
+
         if not self.camera.is_open:
             frame = self._blank_frame("Camera indisponivel")
             detection = FaceDetection(found=False, feedback="Camera indisponivel")
@@ -1761,7 +1794,7 @@ class MainApp:
             else:
                 label = "candidato" if candidate.is_within_candidate_threshold else "baixo consenso"
                 extra_lines.append(
-                    f"{label}: {candidate.registration_id} | dist={candidate.distance:.3f} | pose={POSE_LABELS[candidate.matched_pose]}"
+                    f"{label}: código {candidate.registration_id} | dist={candidate.distance:.3f} | pose={POSE_LABELS[candidate.matched_pose]}"
                 )
 
             if self.temporal_window.ready():
@@ -1815,13 +1848,7 @@ class MainApp:
                 (0, 220, 0),
                 duration=3.0,
             )
-            typed, typing_message = self.keyboard_typer.type_identifier(
-                decision.registration_id,
-                enabled=self.typing_enabled_var.get() and self.mode == "recognition",
-            )
-            self.status_vars["typing"].set(typing_message)
-            if typed:
-                logging.info("Identificador digitado via pynput: %s", decision.registration_id)
+            self._handle_card_code_typing_request(decision.registration_id, decision.user_name or "")
             return
 
         if decision.status == "unknown":
@@ -1834,6 +1861,197 @@ class MainApp:
         self.status_vars["distance"].set(self._format_distance(decision.mean_distance))
         self._set_status("Baixa confianca. Continue olhando para a camera.", (0, 220, 255), duration=2.0)
 
+    def _handle_card_code_typing_request(self, card_code: str, user_name: str) -> None:
+        enabled = self.config.type_recognized_id and self.mode == "recognition"
+        allowed, typing_message = self.keyboard_typer.can_type_identifier(card_code, enabled=enabled)
+        if not allowed:
+            self.status_vars["typing"].set(typing_message)
+            return
+
+        if not self.typing_enabled_var.get():
+            typed, typing_message = self.keyboard_typer.type_identifier(card_code, enabled=enabled)
+            self.status_vars["typing"].set(typing_message)
+            if typed:
+                logging.info("Código do cartão digitado automaticamente via pynput: %s", card_code)
+            return
+
+        if self.pending_typing_code == card_code and (
+            self.typing_prompt_window is not None or self.pending_mouse_listener is not None
+        ):
+            return
+
+        self._open_typing_confirmation_popup(card_code, user_name)
+
+    def _open_typing_confirmation_popup(self, card_code: str, user_name: str) -> None:
+        self._cancel_pending_typing_prompt()
+        self.pending_typing_code = card_code
+
+        self.typing_prompt_window = tk.Toplevel(self.root)
+        self.typing_prompt_window.title("Confirmar código do cartão")
+        self.typing_prompt_window.geometry("430x210")
+        self.typing_prompt_window.resizable(False, False)
+        self.typing_prompt_window.configure(bg=self.config.sidebar_color)
+        self.typing_prompt_window.attributes("-topmost", True)
+        self.typing_prompt_window.columnconfigure(0, weight=1)
+
+        tk.Label(
+            self.typing_prompt_window,
+            text="Código do cartão reconhecido",
+            bg=self.config.sidebar_color,
+            fg="#ffffff",
+            font=("Segoe UI", 13, "bold"),
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
+
+        tk.Label(
+            self.typing_prompt_window,
+            text=f"{user_name}\nCódigo: {card_code}",
+            bg=self.config.sidebar_color,
+            fg="#d9e2ec",
+            font=("Segoe UI", 10),
+            justify="center",
+        ).grid(row=1, column=0, sticky="ew", padx=16)
+
+        tk.Label(
+            self.typing_prompt_window,
+            text="Confirme e depois clique no campo onde o código deve ser digitado.",
+            bg=self.config.sidebar_color,
+            fg="#ffffff",
+            font=("Segoe UI", 9),
+            wraplength=370,
+            justify="center",
+        ).grid(row=2, column=0, sticky="ew", padx=16, pady=(10, 12))
+
+        button_frame = tk.Frame(self.typing_prompt_window, bg=self.config.sidebar_color)
+        button_frame.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        button_frame.columnconfigure(0, weight=1)
+        button_frame.columnconfigure(1, weight=1)
+
+        tk.Button(
+            button_frame,
+            text="Confirmar",
+            command=lambda: self._arm_typing_on_next_click(card_code),
+            bg=self.config.register_button_color,
+            fg=self.config.button_text_color,
+            activebackground=self.config.register_button_color,
+            activeforeground=self.config.button_text_color,
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=8,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        tk.Button(
+            button_frame,
+            text="Cancelar",
+            command=self._cancel_pending_typing_prompt,
+            bg=self.config.close_button_color,
+            fg=self.config.button_text_color,
+            activebackground=self.config.close_button_color,
+            activeforeground=self.config.button_text_color,
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=8,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        self.typing_prompt_window.protocol("WM_DELETE_WINDOW", self._cancel_pending_typing_prompt)
+        self.status_vars["typing"].set("aguardando confirmação do operador")
+
+    def _arm_typing_on_next_click(self, card_code: str) -> None:
+        allowed, typing_message = self.keyboard_typer.can_type_identifier(
+            card_code,
+            enabled=self.config.type_recognized_id and self.mode == "recognition",
+        )
+        if not allowed:
+            self.status_vars["typing"].set(typing_message)
+            self._cancel_pending_typing_prompt()
+            return
+
+        if self.typing_prompt_window is not None:
+            try:
+                self.typing_prompt_window.destroy()
+            except tk.TclError:
+                pass
+            self.typing_prompt_window = None
+
+        self.status_vars["typing"].set("clique no campo de destino")
+        try:
+            from pynput import mouse
+
+            self.pending_mouse_listener = mouse.Listener(
+                on_click=lambda _x, _y, _button, pressed: self._on_destination_mouse_click(card_code, pressed)
+            )
+            self.pending_mouse_listener.start()
+            self.status_vars["typing"].set("aguardando clique no campo de destino")
+        except Exception as exc:
+            logging.exception("Falha ao aguardar clique do mouse: %s", exc)
+            self.pending_mouse_listener = None
+            self.pending_typing_code = None
+            self.pending_typing_due_at = 0.0
+            self.status_vars["typing"].set(f"mouse indisponivel: {exc}")
+
+    def _on_destination_mouse_click(self, card_code: str, pressed: bool) -> bool:
+        if not pressed:
+            return True
+
+        listener = self.pending_mouse_listener
+        self.pending_mouse_listener = None
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+
+        self.pending_typing_due_at = time.time() + 0.55
+        self.status_vars["typing"].set("campo selecionado; digitando em instantes")
+        return False
+
+    def _process_due_pending_typing(self) -> None:
+        if not self.pending_typing_code or self.pending_typing_due_at <= 0.0:
+            return
+        if time.time() < self.pending_typing_due_at:
+            return
+
+        card_code = self.pending_typing_code
+        self.pending_typing_due_at = 0.0
+        self._type_pending_card_code(card_code)
+
+    def _type_pending_card_code(self, card_code: str) -> None:
+        if self.pending_typing_code != card_code:
+            return
+
+        typed, typing_message = self.keyboard_typer.type_identifier(
+            card_code,
+            enabled=self.config.type_recognized_id and self.mode == "recognition",
+        )
+        self.pending_typing_code = None
+        self.pending_typing_due_at = 0.0
+        self.status_vars["typing"].set(typing_message)
+        if typed:
+            logging.info("Código do cartão digitado via pynput: %s", card_code)
+
+    def _cancel_pending_typing_prompt(self) -> None:
+        if self.pending_mouse_listener is not None:
+            try:
+                self.pending_mouse_listener.stop()
+            except Exception:
+                pass
+            self.pending_mouse_listener = None
+
+        if self.typing_prompt_window is not None:
+            try:
+                self.typing_prompt_window.destroy()
+            except tk.TclError:
+                pass
+            self.typing_prompt_window = None
+
+        self.pending_typing_code = None
+        self.pending_typing_due_at = 0.0
+
     def start_registration(self) -> None:
         if self.mode != "recognition":
             messagebox.showinfo("Operacao em andamento", "Finalize ou cancele o cadastro atual antes de iniciar outro.", parent=self.root)
@@ -1842,12 +2060,16 @@ class MainApp:
             messagebox.showerror("Camera indisponivel", "A webcam precisa estar ativa para cadastrar uma pessoa.", parent=self.root)
             return
 
-        registration_id = simpledialog.askstring("Cadastrar pessoa", "Digite o ID ou matricula:", parent=self.root)
+        registration_id = simpledialog.askstring(
+            "Cadastrar pessoa",
+            f"Digite o código do cartão (hexadecimal, até {CARD_CODE_MAX_LENGTH} dígitos):",
+            parent=self.root,
+        )
         if registration_id is None:
             return
-        registration_id = registration_id.strip()
-        if not registration_id:
-            messagebox.showerror("ID invalido", "O ID/matricula nao pode ficar vazio.", parent=self.root)
+        is_valid_card_code, registration_id, card_code_error = validate_card_code(registration_id)
+        if not is_valid_card_code:
+            messagebox.showerror("Código do cartão inválido", card_code_error, parent=self.root)
             return
 
         name = simpledialog.askstring("Cadastrar pessoa", "Digite o nome da pessoa:", parent=self.root)
@@ -1862,7 +2084,7 @@ class MainApp:
         if existing_user:
             should_extend = messagebox.askyesno(
                 "Pessoa ja cadastrada",
-                f"A matricula {registration_id} ja existe para {existing_user['name']}.\nDeseja adicionar novas amostras?",
+                f"O código do cartão {registration_id} já existe para {existing_user['name']}.\nDeseja adicionar novas amostras?",
                 parent=self.root,
             )
             if not should_extend:
@@ -1972,7 +2194,7 @@ class MainApp:
             self._set_status("Cadastro concluido", (0, 220, 0), duration=3.0)
             messagebox.showinfo(
                 "Cadastro concluido",
-                f"Cadastro concluído com sucesso.\n\n{session.name} ({session.registration_id}) foi cadastrado com amostras front/left/right.",
+                f"Cadastro concluído com sucesso.\n\n{session.name} (código do cartão {session.registration_id}) foi cadastrado com amostras front/left/right.",
                 parent=self.root,
             )
         except sqlite3.IntegrityError as exc:
@@ -2025,7 +2247,7 @@ class MainApp:
 
         title = tk.Label(
             self.delete_window,
-            text="Excluir usuário por ID/matrícula",
+            text="Excluir usuário por código do cartão",
             bg=self.config.sidebar_color,
             fg="#ffffff",
             font=("Segoe UI", 13, "bold"),
@@ -2038,7 +2260,7 @@ class MainApp:
         search_frame.columnconfigure(0, weight=1)
         tk.Label(
             search_frame,
-            text="Buscar por ID/matrícula",
+            text="Buscar por código do cartão",
             bg=self.config.sidebar_color,
             fg="#d9e2ec",
             font=("Segoe UI", 9),
@@ -2052,7 +2274,7 @@ class MainApp:
         selected_frame.columnconfigure(0, weight=1)
         tk.Label(
             selected_frame,
-            text="ID/matrícula selecionado",
+            text="Código do cartão selecionado",
             bg=self.config.sidebar_color,
             fg="#d9e2ec",
             font=("Segoe UI", 9),
@@ -2102,7 +2324,7 @@ class MainApp:
         delete_button.grid(row=0, column=0, sticky="ew")
 
         def user_label(user: sqlite3.Row) -> str:
-            return f"{user['name']} — {user['registration_id']}"
+            return f"{user['name']} — código {user['registration_id']}"
 
         def refresh_user_list() -> None:
             nonlocal display_users
@@ -2130,17 +2352,17 @@ class MainApp:
             registration_var.set(str(display_users[index]["registration_id"]))
 
         def confirm_delete() -> None:
-            registration_id = registration_var.get().strip()
-            if not registration_id:
-                messagebox.showerror("Matrícula obrigatória", "Informe ou selecione um ID/matrícula para excluir.", parent=self.delete_window)
+            is_valid_card_code, registration_id, card_code_error = validate_card_code(registration_var.get())
+            if not is_valid_card_code:
+                messagebox.showerror("Código do cartão inválido", card_code_error, parent=self.delete_window)
                 return
 
             user = self.db.get_user_by_registration(registration_id)
             if user is None:
-                messagebox.showerror("Usuário não encontrado", "Nenhum usuário cadastrado possui essa matrícula.", parent=self.delete_window)
+                messagebox.showerror("Usuário não encontrado", "Nenhum usuário cadastrado possui esse código do cartão.", parent=self.delete_window)
                 return
 
-            user_text = f"{user['name']} — {user['registration_id']}"
+            user_text = f"{user['name']} — código {user['registration_id']}"
             confirmed = messagebox.askyesno(
                 "Confirmar exclusão",
                 f"Tem certeza que deseja excluir o usuário {user_text}?",
@@ -2151,7 +2373,7 @@ class MainApp:
 
             deleted = self.db.delete_user_by_registration_id(registration_id)
             if deleted is None:
-                messagebox.showerror("Usuário não encontrado", "A matrícula informada não existe mais no banco.", parent=self.delete_window)
+                messagebox.showerror("Usuário não encontrado", "O código do cartão informado não existe mais no banco.", parent=self.delete_window)
                 return
 
             self.cache.refresh(force=True)
@@ -2194,17 +2416,17 @@ class MainApp:
         self.status_vars["database"].set(f"conectado: {self.cache.user_count} usuario(s), {self.cache.sample_count} amostra(s)")
 
     def _update_typing_status(self) -> None:
-        enabled = self.typing_enabled_var.get()
-        if enabled and not self.keyboard_typer.available:
+        ask_before_typing = self.typing_enabled_var.get()
+        typing_available = self.config.type_recognized_id and self.keyboard_typer.available
+        if ask_before_typing and not typing_available:
             self.typing_enabled_var.set(False)
-            enabled = False
-        if not enabled:
-            self.enter_typing_enabled_var.set(False)
+            ask_before_typing = False
         self._update_enter_typing_status()
-        if enabled:
+        if typing_available:
             enter_status = "com Enter" if self.config.press_enter_after_typing else "sem Enter"
+            prompt_status = "pergunta antes" if ask_before_typing else "digita direto"
             self.status_vars["typing"].set(
-                f"ativa, {enter_status}, max {self.config.max_consecutive_typings_per_id} por ID, cooldown {self.config.type_cooldown_seconds:.1f}s"
+                f"ativa, {prompt_status}, {enter_status}, max {self.config.max_consecutive_typings_per_id} por código"
             )
         elif not self.keyboard_typer.available:
             self.status_vars["typing"].set("indisponivel")
@@ -2212,11 +2434,11 @@ class MainApp:
             self.status_vars["typing"].set("desativada")
 
     def _update_enter_typing_status(self) -> None:
-        typing_enabled = self.typing_enabled_var.get()
-        if not typing_enabled:
+        typing_available = self.config.type_recognized_id and self.keyboard_typer.available
+        if not typing_available:
             self.enter_typing_enabled_var.set(False)
-        self.config.press_enter_after_typing = bool(self.enter_typing_enabled_var.get() and typing_enabled)
-        state = "normal" if typing_enabled else "disabled"
+        self.config.press_enter_after_typing = bool(self.enter_typing_enabled_var.get() and typing_available)
+        state = "normal" if typing_available else "disabled"
         if hasattr(self, "enter_typing_check"):
             self.enter_typing_check.configure(state=state)
 
@@ -2302,6 +2524,8 @@ class MainApp:
         return f"{distance:.3f}"
 
     def close(self) -> None:
+        self._cancel_pending_typing_prompt()
+
         if self.delete_window is not None:
             try:
                 self.delete_window.destroy()
@@ -2339,9 +2563,9 @@ def build_config_from_args() -> AppConfig:
     parser.add_argument("--samples-per-pose", type=int, default=15, help="Frames validos capturados por pose no cadastro.")
     parser.add_argument("--min-samples-per-pose", type=int, default=8, help="Minimo de frames validos aceitos por pose no cadastro.")
     parser.add_argument("--type-cooldown", type=float, default=5.0, help="Cooldown em segundos para digitacao automatica.")
-    parser.add_argument("--max-consecutive-typings", type=int, default=1, help="Maximo de digitacoes consecutivas para o mesmo ID/matricula.")
-    parser.add_argument("--disable-auto-type", action="store_true", help="Inicia com digitacao automatica desativada.")
-    parser.add_argument("--press-enter-after-typing", action="store_true", help="Pressiona Enter apos digitar o ID reconhecido.")
+    parser.add_argument("--max-consecutive-typings", type=int, default=1, help="Maximo de digitacoes consecutivas para o mesmo codigo do cartao.")
+    parser.add_argument("--disable-auto-type", action="store_true", help="Inicia com a pergunta para digitar o codigo do cartao desativada.")
+    parser.add_argument("--press-enter-after-typing", action="store_true", help="Pressiona Enter apos digitar o codigo do cartao reconhecido.")
     parser.add_argument("--min-window-width", type=int, default=420, help="Largura minima da janela principal.")
     parser.add_argument("--min-window-height", type=int, default=300, help="Altura minima da janela principal.")
     parser.add_argument("--db-path", type=str, default="", help="Caminho opcional para o banco SQLite.")
