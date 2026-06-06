@@ -58,6 +58,13 @@ def validate_card_code(value: str) -> Tuple[bool, str, str]:
     return True, card_code, ""
 
 
+def validate_existing_card_code_lookup(value: str) -> Tuple[bool, str, str]:
+    card_code = normalize_card_code(value)
+    if not card_code:
+        return False, card_code, "Informe o código do cartão cadastrado."
+    return True, card_code, ""
+
+
 @dataclass(slots=True)
 class AppConfig:
     camera_index: int = 0
@@ -1848,6 +1855,9 @@ class MainApp:
                 (0, 220, 0),
                 duration=3.0,
             )
+            if self._delete_window_is_open():
+                self.status_vars["typing"].set("pausada durante exclusão")
+                return
             self._handle_card_code_typing_request(decision.registration_id, decision.user_name or "")
             return
 
@@ -1860,6 +1870,15 @@ class MainApp:
 
         self.status_vars["distance"].set(self._format_distance(decision.mean_distance))
         self._set_status("Baixa confianca. Continue olhando para a camera.", (0, 220, 255), duration=2.0)
+
+    def _delete_window_is_open(self) -> bool:
+        if self.delete_window is None:
+            return False
+        try:
+            return bool(self.delete_window.winfo_exists())
+        except tk.TclError:
+            self.delete_window = None
+            return False
 
     def _handle_card_code_typing_request(self, card_code: str, user_name: str) -> None:
         enabled = self.config.type_recognized_id and self.mode == "recognition"
@@ -2229,7 +2248,12 @@ class MainApp:
         if self.delete_window is not None and self.delete_window.winfo_exists():
             self.delete_window.lift()
             self.delete_window.focus_force()
+            self.status_vars["typing"].set("pausada durante exclusão")
             return
+
+        self._cancel_pending_typing_prompt()
+        self.keyboard_typer.reset_typing_session()
+        self.status_vars["typing"].set("pausada durante exclusão")
 
         self.delete_window = tk.Toplevel(self.root)
         self.delete_window.title("Excluir pessoa")
@@ -2352,7 +2376,7 @@ class MainApp:
             registration_var.set(str(display_users[index]["registration_id"]))
 
         def confirm_delete() -> None:
-            is_valid_card_code, registration_id, card_code_error = validate_card_code(registration_var.get())
+            is_valid_card_code, registration_id, card_code_error = validate_existing_card_code_lookup(registration_var.get())
             if not is_valid_card_code:
                 messagebox.showerror("Código do cartão inválido", card_code_error, parent=self.delete_window)
                 return
@@ -2394,6 +2418,7 @@ class MainApp:
                 except tk.TclError:
                     pass
                 self.delete_window = None
+            self._update_typing_status()
 
         search_var.trace_add("write", lambda *_args: refresh_user_list())
         user_listbox.bind("<<ListboxSelect>>", fill_selected_registration)
